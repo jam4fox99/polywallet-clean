@@ -1,5 +1,6 @@
 """
 DIAGNOSTIC VERSION - Very detailed logging to find the hang
+Now with Supabase caching for incremental syncing!
 """
 import os
 import argparse
@@ -14,11 +15,12 @@ from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Border, Side
 from openpyxl.utils import get_column_letter
 import traceback
+from src import db_cache
 
 BASE_URL = "https://data-api.polymarket.com"
 GAMMA_URL = "https://gamma-api.polymarket.com"
 PROXY_URL = os.getenv("PROXY_URL")
-ROOT_DIR = Path(__file__).resolve().parent
+ROOT_DIR = Path(__file__).resolve().parent.parent  # Go up from src/ to project root
 DEFAULT_WALLET_FILE = ROOT_DIR / "data" / "wallets.csv"
 DEFAULT_OUTPUT_FILE = ROOT_DIR / "output" / "report.xlsx"
 
@@ -33,12 +35,13 @@ PAGES_PER_BATCH = 20  # pages to fetch in parallel per wallet/endpoint
 PRICE_TIERS = [(90,100,"90-100c"),(80,90,"80-90c"),(70,80,"70-80c"),(60,70,"60-70c"),(50,60,"50-60c"),(40,50,"40-50c"),(30,40,"30-40c"),(20,30,"20-30c"),(10,20,"10-20c"),(0,10,"0-10c")]
 
 class MultiWalletReportGenerator:
-    def __init__(self, proxy_url: str | None = PROXY_URL):
+    def __init__(self, proxy_url: str | None = PROXY_URL, use_cache: bool = True):
         self.api_calls = 0
         self.retries = 0
         self.errors = 0
         self.skipped = 0
         self.proxy_url = proxy_url
+        self.use_cache = use_cache and db_cache.is_cache_enabled()
         self.market_tags_cache = {}
         self.cache_lock = asyncio.Lock()
         self.wallet_semaphore = asyncio.Semaphore(MAX_CONCURRENT_WALLETS)
@@ -47,6 +50,8 @@ class MultiWalletReportGenerator:
         self.start_time = None
         self.active_wallets = {}
         self.results_list = []  # Store results as we go
+        self.cache_hits = 0
+        self.new_trades_fetched = 0
         
     async def fetch(self, session, url, params=None):
         for attempt in range(MAX_RETRIES):
@@ -111,6 +116,14 @@ class MultiWalletReportGenerator:
             if slug in self.market_tags_cache:
                 return slug, self.market_tags_cache[slug]
         
+        # Check Supabase cache
+        if self.use_cache:
+            db_tags = db_cache.get_cached_market_tags([slug])
+            if slug in db_tags:
+                async with self.cache_lock:
+                    self.market_tags_cache[slug] = db_tags[slug]
+                return slug, db_tags[slug]
+        
         tags = []
         async with category_sem:
             data = await self.fetch(session, f"{GAMMA_URL}/markets", {"slug": slug})
@@ -123,22 +136,110 @@ class MultiWalletReportGenerator:
         
         async with self.cache_lock:
             self.market_tags_cache[slug] = tags
+        
+        # Save to Supabase
+        if self.use_cache and tags:
+            db_cache.save_market_tags(slug, tags)
+        
         return slug, tags
 
     async def fetch_wallet_data(self, session, wallet):
         ws = wallet[:10]
+        # Fetch leaderboard for all time periods
         self.active_wallets[ws] = "leaderboard"
-        lb = await self.fetch(session, f"{BASE_URL}/v1/leaderboard", {"timePeriod": "all", "user": wallet})
+        lb_all = await self.fetch(session, f"{BASE_URL}/v1/leaderboard", {"timePeriod": "all", "user": wallet})
+        lb_day = await self.fetch(session, f"{BASE_URL}/v1/leaderboard", {"timePeriod": "day", "user": wallet})
+        lb_week = await self.fetch(session, f"{BASE_URL}/v1/leaderboard", {"timePeriod": "week", "user": wallet})
+        lb_month = await self.fetch(session, f"{BASE_URL}/v1/leaderboard", {"timePeriod": "month", "user": wallet})
+        lb = lb_all  # Use all-time for main stats
+        lb_periods = {"all": lb_all, "day": lb_day, "week": lb_week, "month": lb_month}
         self.active_wallets[ws] = "traded"
         traded = await self.fetch(session, f"{BASE_URL}/traded", {"user": wallet})
+        
+        # Check cache for existing trades
+        cached_trades = []
+        last_ts = 0
+        if self.use_cache:
+            self.active_wallets[ws] = "cache-check"
+            last_ts = db_cache.get_last_trade_timestamp(wallet)
+            if last_ts > 0:
+                cached_trades = db_cache.get_cached_trades(wallet)
+                self.cache_hits += len(cached_trades)
+                print(f"  [Cache] {ws}: Found {len(cached_trades)} cached trades, last_ts={last_ts}")
+        
+        # Fetch trades - if we have cached data, fetch incrementally
         self.active_wallets[ws] = "trades"
-        trades = await self.fetch_all_paginated(session, "trades", wallet, 500, {}, ws, max_pages=5000)
+        if last_ts > 0 and cached_trades:
+            # Fetch new trades only (pages until we hit old timestamps)
+            new_trades = await self.fetch_trades_incremental(session, wallet, last_ts, ws)
+            trades = new_trades + cached_trades
+            self.new_trades_fetched += len(new_trades)
+            print(f"  [Cache] {ws}: Fetched {len(new_trades)} new trades, total={len(trades)}")
+        else:
+            # First time - fetch all
+            trades = await self.fetch_all_paginated(session, "trades", wallet, 500, {}, ws, max_pages=5000)
+            self.new_trades_fetched += len(trades)
+        
         self.active_wallets[ws] = "closed-pos"
-        # closed-positions max limit enforced by API is 50
         closed = await self.fetch_all_paginated(session, "closed-positions", wallet, 50, {"sortBy": "realizedpnl", "sortDirection": "DESC"}, ws)
         self.active_wallets[ws] = "positions"
         positions = await self.fetch_all_paginated(session, "positions", wallet, 500, {"sortBy": "CURRENT", "sortDirection": "DESC"}, ws)
-        return {"leaderboard": lb, "traded": traded, "trades": trades, "closed": closed, "positions": positions}
+        
+        # Save to cache
+        if self.use_cache:
+            self.active_wallets[ws] = "cache-save"
+            username = lb[0].get("userName", "") if lb and len(lb) > 0 else ""
+            rank = lb[0].get("rank") if lb and len(lb) > 0 else None
+            db_cache.save_wallet(wallet, username, rank)
+            # Only save new trades (not cached ones)
+            if trades:
+                trades_to_save = [t for t in trades if t.get("timestamp", 0) > last_ts] if last_ts > 0 else trades
+                if trades_to_save:
+                    db_cache.save_trades(wallet, trades_to_save)
+            if closed:
+                db_cache.save_closed_positions(wallet, closed)
+            # Save open positions (always fresh)
+            db_cache.save_open_positions(wallet, positions or [])
+            # Save leaderboard rankings for all time periods
+            db_cache.save_wallet_leaderboard_stats(wallet, lb_periods)
+        
+        return {"leaderboard": lb, "traded": traded, "trades": trades, "closed": closed, "positions": positions, "lb_periods": lb_periods}
+    
+    async def fetch_trades_incremental(self, session, wallet, last_ts, wallet_short):
+        """Fetch only new trades after last_ts timestamp."""
+        all_new = []
+        offset = 0
+        limit = 500
+        page = 0
+        
+        while True:
+            self.active_wallets[wallet_short] = f"trades-inc pg{page + 1}"
+            params = {"user": wallet, "limit": limit, "offset": offset}
+            data = await self.fetch(session, f"{BASE_URL}/trades", params)
+            
+            if not data:
+                break
+            
+            # Filter to only trades newer than last_ts
+            new_in_page = [t for t in data if t.get("timestamp", 0) > last_ts]
+            all_new.extend(new_in_page)
+            
+            # If we found older trades, we've caught up - stop
+            if len(new_in_page) < len(data):
+                break
+            
+            # If page was short, we've reached the end
+            if len(data) < limit:
+                break
+            
+            offset += limit
+            page += 1
+            
+            # Safety limit
+            if page > 100:
+                break
+        
+        return all_new
 
     def calculate_stats(self, data):
         stats = {}
@@ -503,6 +604,14 @@ class MultiWalletReportGenerator:
                 hold = self.calculate_hold_times(data["trades"] or [])
                 pos = self.format_positions_with_dates(data["closed"] or [], data["trades"] or [])
                 
+                # STEP 5: Save all calculated stats to cache
+                if self.use_cache:
+                    self.active_wallets[ws] = "save-stats"
+                    db_cache.save_wallet_stats(wallet, stats)
+                    db_cache.save_price_tiers(wallet, tiers)
+                    db_cache.save_categories(wallet, cats)
+                    db_cache.save_hold_times(wallet, hold)
+                
                 wallet_time = time.time() - start
                 self.completed += 1
                 
@@ -574,6 +683,8 @@ class MultiWalletReportGenerator:
         elapsed = time.time() - self.start_time
         print(f"\nDONE! {elapsed:.1f}s ({elapsed/60:.1f} min)")
         print(f"OK: {successful} | Skipped: {self.skipped} | Errors: {self.errors}")
+        if self.use_cache:
+            print(f"Cache: {self.cache_hits} cached trades used | {self.new_trades_fetched} new trades fetched")
         print(f"Output: {output_path}")
 
 def parse_args():
@@ -601,6 +712,11 @@ def parse_args():
         action="store_true",
         help="Disable BrightData proxy and call APIs directly",
     )
+    parser.add_argument(
+        "--no-cache",
+        action="store_true",
+        help="Disable Supabase caching (fetch all data fresh)",
+    )
     return parser.parse_args()
 
 async def main():
@@ -623,7 +739,20 @@ async def main():
     print(f"Writing report to {output_path}")
     print(f"Proxy: {'disabled' if args.no_proxy else 'enabled'}")
     
-    generator = MultiWalletReportGenerator(proxy_url=None if args.no_proxy else PROXY_URL)
+    # Cache status
+    use_cache = not args.no_cache
+    cache_available = db_cache.is_cache_enabled()
+    if use_cache and cache_available:
+        print(f"Cache: ENABLED (Supabase)")
+    elif use_cache and not cache_available:
+        print(f"Cache: NOT CONFIGURED (set SUPABASE_URL and SUPABASE_KEY in .env)")
+    else:
+        print(f"Cache: DISABLED (--no-cache flag)")
+    
+    generator = MultiWalletReportGenerator(
+        proxy_url=None if args.no_proxy else PROXY_URL,
+        use_cache=use_cache
+    )
     await generator.generate_multi_report(wallets, output_path)
 
 if __name__ == "__main__":

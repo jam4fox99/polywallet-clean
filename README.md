@@ -1,80 +1,72 @@
-# Polymarket Wallet Checker
+# Polymarket Wallet Analyzer
 
-Generate detailed XLSX reports for Polymarket wallet performance analysis.
+Analyze top Polymarket traders, cache data in Supabase, and backtest copy trading strategies.
 
 ## Features
 
-- Fetch wallet PnL, trades, and positions from Polymarket APIs
-- Generate Excel reports with:
-  - PnL breakdown (1D, 7D, 30D, All-time)
-  - Stats (volume, ROI, win rate, avg bet size)
-  - Price tier analysis
-  - Category breakdown (Sports, Esports, Crypto, etc.)
-  - All trades grouped by category with ROI %
-- Support for BrightData proxy to avoid rate limits
+- Fetch and Cache top 10,000 weekly traders from Polymarket leaderboard
+- Full Analysis: Store trades, positions, stats, price tiers for each wallet
+- Zero-API Reports: Generate Excel reports entirely from cached Supabase data
+- Copy Trading Backtest: Simulate copy trading strategies to find best wallets
 
 ## Setup
 
-1. Clone the repo:
-```bash
-git clone https://github.com/YOUR_USERNAME/poly-wallet-checker.git
-cd poly-wallet-checker
-```
+### 1. Install Dependencies
 
-2. Install dependencies:
 ```bash
 pip install -r requirements.txt
 ```
 
-3. (Optional) Set up proxy - create `.env` file:
-```
-PROXY_URL=http://your-brightdata-proxy-url
-```
+### 2. Environment Variables
+
+Copy `.env.example` to `.env` and fill in your credentials:
+
+- SUPABASE_URL - Your Supabase project URL (from Settings > API)
+- SUPABASE_KEY - Your Supabase anon key (from Settings > API)
+- PROXY_URL - Optional BrightData proxy URL
+
+### 3. Database Setup
+
+Create the required tables in Supabase SQL Editor. See docs/COMMANDS.md for schema.
 
 ## Usage
 
-### Generate Report
-
-Create a CSV file with wallet addresses (one per line with header "wallet"):
-```csv
-wallet
-0x8c0b024c17831a0dde038547b7e791ae6a0d7aa5
-0xabc123...
-```
-
-Run the report:
+### Fetch Leaderboard
 ```bash
-# With proxy
-python run_468_report.py --wallet-file data/wallets.csv --output output/report.xlsx
-
-# Without proxy (direct API calls)
-python run_468_report.py --wallet-file data/wallets.csv --output output/report.xlsx --no-proxy
-
-# Test with limited wallets
-python run_468_report.py --wallet-file data/wallets.csv --limit 5 --no-proxy
+python src/fetch_leaderboard.py
 ```
 
-### Verify PnL Calculations
-
+### Analyze Wallets
 ```bash
-python verify_pnl.py --wallet-file data/wallets.csv --output output/verification.csv
+python -u src/analyze_weekly_leaders.py
 ```
 
-### Test Proxy Connection
-
+### Generate Reports (from cache)
 ```bash
-python test_proxy.py
+python src/generate_report.py --limit 30
 ```
 
-## Files
+### Backtest Copy Trading
+```bash
+python src/backtest_copy.py
+```
 
-| File | Purpose |
-|------|---------|
-| `run_468_report.py` | Main report generator |
-| `verify_pnl.py` | Verify PnL calculations match leaderboard |
-| `test_proxy.py` | Test BrightData proxy connection |
-| `CALCULATIONS.md` | Documentation of all calculations |
+## Project Structure
 
-## Documentation
+```
+src/
+  db_cache.py              - Supabase caching layer
+  analyze_weekly_leaders.py - Bulk wallet analyzer
+  generate_report.py       - Excel from cache
+  fetch_leaderboard.py     - Fetch top traders
+  backtest_copy.py         - Copy trading simulator
+output/                    - Generated Excel reports
+```
 
-See [CALCULATIONS.md](CALCULATIONS.md) for detailed explanation of how all metrics are calculated.
+## Environment Variables
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| SUPABASE_URL | Yes | Supabase project URL |
+| SUPABASE_KEY | Yes | Supabase anon key |
+| PROXY_URL | No | Proxy for rate limits |
