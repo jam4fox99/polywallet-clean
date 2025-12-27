@@ -18,6 +18,7 @@ from pathlib import Path
 load_dotenv(Path(__file__).parent.parent / ".env")
 
 from src import db_cache
+from src.pnl_calculator import calculate_time_period_pnl, calculate_unrealized_pnl
 
 BASE_URL = "https://data-api.polymarket.com"
 PROXY_URL = os.getenv("PROXY_URL")
@@ -87,25 +88,29 @@ async def analyze_wallet(session, wallet, lb_data, client):
     unique_markets = set(t.get("conditionId") for t in weekly_buys if t.get("conditionId"))
     weekly_positions = len(unique_markets)
     
-    # Calculate stats
-    realized_1d = sum(float(p.get("realizedPnl", 0)) for p in closed if (p.get("timestamp") or 0) >= DAY_AGO)
-    realized_7d = sum(float(p.get("realizedPnl", 0)) for p in closed)
-    unrealized = sum(float(p.get("unrealizedPnl", 0)) for p in positions)
+    # Calculate stats using correct methodology (resolution timestamp-based)
+    # Key: Use timestamp field which is the RESOLUTION time, not entry time
+    pnl_stats = calculate_time_period_pnl(closed)
+    unrealized_stats = calculate_unrealized_pnl(positions)
     
-    wins = sum(1 for p in closed if float(p.get("realizedPnl", 0)) > 0)
-    losses = sum(1 for p in closed if float(p.get("realizedPnl", 0)) < 0)
-    win_rate = round((wins / (wins + losses)) * 100, 2) if (wins + losses) > 0 else 0
+    realized_1d = pnl_stats["realized_1d"]
+    realized_7d = pnl_stats["realized_7d"]
+    unrealized = unrealized_stats["unrealized_pnl"]
+    wins = pnl_stats["wins"]
+    losses = pnl_stats["losses"]
+    win_rate = pnl_stats["win_rate"]
     
     total_invested = sum(float(t.get("usdcSize", 0)) for t in trades if t.get("side") == "BUY")
     roi = round((realized_7d / total_invested) * 100, 2) if total_invested > 0 else 0
     avg_bet = round(total_invested / len(trades), 2) if trades else 0
     
-    # Save wallet stats
+    # Save wallet stats with correct time-based PnL calculations
     try:
         client.table("wallet_stats").upsert({
             "wallet": wallet, "username": username, "rank": rank,
             "realized_1d": realized_1d, "realized_7d": realized_7d,
-            "realized_30d": realized_7d, "realized_all": realized_7d,
+            "realized_30d": pnl_stats["realized_30d"], 
+            "realized_all": pnl_stats["realized_all"],
             "unrealized_pnl": unrealized, "total_pnl": realized_7d + unrealized,
             "volume": volume, "roi": roi, "win_rate": win_rate,
             "wins": wins, "losses": losses,
